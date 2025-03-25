@@ -2,8 +2,7 @@ import os
 import psycopg2
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
-import numpy as np
+import json
 
 load_dotenv()
 
@@ -43,7 +42,8 @@ def create_tables():
         id SERIAL PRIMARY KEY,
         user_id TEXT NOT NULL,
         question TEXT NOT NULL,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        cluster_id INTEGER
     )
     """)
     cursor.execute("""
@@ -104,15 +104,21 @@ def create_tables():
         id SERIAL PRIMARY KEY,
         query TEXT NOT NULL,
         answer TEXT NOT NULL,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        cluster_id INTEGER
+    )
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS QuestionClusters (
+        id SERIAL PRIMARY KEY,
+        representative_question TEXT NOT NULL,
+        questions JSONB NOT NULL,
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
     conn.commit()
 
 create_tables()
-
-# Загрузка модели эмбеддингов (например, "paraphrase-MiniLM-L6-v2" — легкая и быстрая)
-embedding_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
 
 def add_pending_question(user_id, question):
     try:
@@ -126,33 +132,13 @@ def add_pending_question(user_id, question):
     except Exception as e:
         print("Ошибка при добавлении вопроса:", e)
 
-def get_pending_question_by_user(user_id):
-    try:
-        cursor.execute("""
-            SELECT question, timestamp
-            FROM PendingQuestions 
-            WHERE user_id = %s 
-            ORDER BY timestamp DESC 
-            LIMIT 1
-        """, (user_id,))
-        row = cursor.fetchone()
-        if row:
-            question, ts = row
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            return (question, ts)
-        else:
-            return None
-    except Exception as e:
-        print("Ошибка при получении последнего вопроса:", e)
-        return None
+def get_all_pending_questions():
+    cursor.execute("SELECT id, user_id, question, timestamp, cluster_id FROM PendingQuestions")
+    return cursor.fetchall()
 
-def delete_pending_question(user_id, question):
+def delete_pending_question(question_id):
     try:
-        cursor.execute(
-            "DELETE FROM PendingQuestions WHERE user_id = %s AND question = %s",
-            (user_id, question)
-        )
+        cursor.execute("DELETE FROM PendingQuestions WHERE id = %s", (question_id,))
         conn.commit()
         return True
     except Exception as e:
@@ -161,23 +147,36 @@ def delete_pending_question(user_id, question):
 
 def exists_pending_question(user_id, question):
     try:
-        cursor.execute(
-            "SELECT id FROM PendingQuestions WHERE user_id = %s AND question = %s",
-            (user_id, question)
-        )
+        cursor.execute("SELECT id FROM PendingQuestions WHERE user_id = %s AND question = %s", (user_id, question))
         return cursor.fetchone() is not None
     except Exception as e:
         print("Ошибка при проверке существования вопроса:", e)
         return False
 
-def is_similar_pending_question(user_id, new_question, threshold=0.85):
-    new_embed = embedding_model.encode([new_question])[0]
-    cursor.execute("SELECT question FROM PendingQuestions WHERE user_id = %s", (user_id,))
-    rows = cursor.fetchall()
-    for row in rows:
-        existing_question = row[0]
-        existing_embed = embedding_model.encode([existing_question])[0]
-        cosine_sim = np.dot(new_embed, existing_embed) / (np.linalg.norm(new_embed) * np.linalg.norm(existing_embed))
-        if cosine_sim >= threshold:
-            return True
-    return False
+def mark_question_answered(question_id, answer, query_text):
+    try:
+        now = datetime.now(timezone.utc)
+        cursor.execute(
+            "INSERT INTO AnsweredQuestions (query, answer, timestamp) VALUES (%s, %s, %s)",
+            (query_text, answer, now)
+        )
+        delete_pending_question(question_id)
+        conn.commit()
+    except Exception as e:
+        print("Ошибка при сохранении ответа:", e)
+
+def search_answered_question(query, similarity_threshold=0.85):
+    cursor.execute("SELECT answer FROM AnsweredQuestions WHERE query ILIKE %s", (f"%{query}%",))
+    return cursor.fetchone()
+
+def add_question_cluster(representative, questions_list):
+    try:
+        now = datetime.now(timezone.utc)
+        questions_json = json.dumps(questions_list, ensure_ascii=False)
+        cursor.execute(
+            "INSERT INTO QuestionClusters (representative_question, questions, timestamp) VALUES (%s, %s, %s)",
+            (representative, questions_json, now)
+        )
+        conn.commit()
+    except Exception as e:
+        print("Ошибка при добавлении кластеров вопросов:", e)
